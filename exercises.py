@@ -1,442 +1,341 @@
 import heapq
 import math
-import os
-import re
-from itertools import combinations
+from openpyxl import load_workbook
 
-import openpyxl
+# =====================================================
+#  ระบบแนะนำการออกกำลังกาย (ใช้ A* Search + Heuristic)
+# =====================================================
+# f(n) = g(n) + h(n)
+# g(n) = "ความเหนื่อยสะสม" ที่เสียไปแล้วตั้งแต่เริ่มวางแผน
+# h(n) = ค่าประมาณความเหนื่อยที่ "ยังต้องเสียอีก" เพื่อให้ได้แคลครบตามเป้า
+# f(n) = ความเหนื่อยรวมโดยคาดการ  (A* จะเลือกแผนที่ f น้อยสุดก่อนเสมอ)
+#
+# state (n) = (วันที่, ท่าที่เล่นไปแล้ววันนี้, แคลที่เผาผลาญสะสม)
+# goal      = เผาผลาญแคลได้ครบตามเป้าหมาย
 
-# =====================================================================
-#  ระบบแนะนำการออกกำลังกายด้วย A* Search
-#  รับ: อายุ, น้ำหนัก, ส่วนสูง, โรคประจำตัว, แคลอรีที่ต้องการลด
-#  อ่านท่าออกกำลังกายและเงื่อนไขจากไฟล์ exercises.xlsx
-# =====================================================================
+FILE_NAME = "exercises.xlsx"
 
-EXCEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exercises.xlsx")   # วางไว้โฟลเดอร์เดียวกับไฟล์นี้
-SHEET_NAME = "exercises"
-MAX_WEEKS = 26          # วางแผนได้สูงสุด 26 สัปดาห์
-WEEK_LOAD = 0.85        # สัปดาห์ที่ไม่ใช่สัปดาห์สุดท้าย ตั้งเป้า 85% ของความจุสูงสุดต่อสัปดาห์ (ไม่หนักเต็มเพดาน)
+DAY_NAMES = ["จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์", "อาทิตย์"]
 
-# ---------------------------------------------------------------------
-#  ตารางกฎ Heuristic (ปรับค่าได้ตามต้องการ)
-# ---------------------------------------------------------------------
-# ค่าเริ่มต้นตามช่วงอายุ
-#   max_days      = ออกกำลังกายได้สูงสุดกี่วันต่อสัปดาห์
-#   max_consec    = ออกกำลังกายติดกันได้สูงสุดกี่วัน (แล้วต้องพัก)
-#   max_kcal      = แคลอรีสูงสุดที่ควรเผาผลาญต่อวัน
-#   max_exercises = จำนวนท่าสูงสุดต่อวัน
-AGE_RULES = {
-    (7, 13):  {"max_days": 4, "max_consec": 2, "max_kcal": 45,  "max_exercises": 3},
-    (14, 19): {"max_days": 5, "max_consec": 3, "max_kcal": 70,  "max_exercises": 3},
-    (20, 39): {"max_days": 5, "max_consec": 3, "max_kcal": 110, "max_exercises": 3},
-    (40, 59): {"max_days": 4, "max_consec": 2, "max_kcal": 60,  "max_exercises": 3},
+# ตำแหน่งวันออกกำลังกายในสัปดาห์ (0 = จันทร์) จัดให้มีวันพักคั่นเสมอ
+WEEK_PATTERN = {
+    1: [0],
+    2: [0, 3],
+    3: [0, 2, 4],
+    4: [0, 1, 3, 5],
+    5: [0, 1, 3, 4, 5],
 }
 
-# โรคประจำตัว -> (คำที่ใช้ค้นในช่อง "เงื่อนไข/ข้อควรระวัง" ของ Excel,
-#                 จำนวนวันที่ต้องลดต่อสัปดาห์, ตัวคูณแคลอรีต่อวัน)
-DISEASE_MENU = {
-    "ความดันโลหิตสูง":              (["ความดันโลหิตสูง"],         1, 0.85),
-    "โรคหัวใจ":                      (["โรคหัวใจ"],                 2, 0.60),
-    "เบาหวาน":                       (["เบาหวาน"],                  0, 0.85),
-    "ปวดเข่า/ข้อเข่าเสื่อม":          (["เข่า"],                     1, 0.85),
-    "ปวดหลัง/หมอนรองกระดูกทับเส้น":   (["หลัง", "หมอนรองกระดูก"],   1, 0.85),
-    "ปวดไหล่":                       (["ไหล่"],                     0, 0.90),
-    "ปวดคอ":                         (["ปวดคอ"],                    0, 0.90),
-    "ข้อเท้า/กระดูกเปราะ":            (["ข้อเท้า", "กระดูกเปราะ"],   1, 0.80),
-    "ปวดข้อมือ":                     (["ข้อมือ"],                   0, 0.90),
+# โรคที่ให้เลือก (ชื่อโรค, คำที่ไปค้นในช่อง "เงื่อนไข/ข้อควรระวัง" ของ excel)
+DISEASES = {
+    1: ("ความดันโลหิตสูง", ["ความดันโลหิตสูง"]),
+    2: ("โรคหัวใจ", ["โรคหัวใจ"]),
+    3: ("เบาหวาน", ["เบาหวาน"]),
+    4: ("ปวดเข่า / ข้อเข่าเสื่อม", ["ปวดเข่า", "ข้อเข่าเสื่อม"]),
+    5: ("ปวดหลัง / หมอนรองกระดูกทับเส้น", ["ปวดหลัง", "หมอนรองกระดูก"]),
+    6: ("ปวดคอ", ["ปวดคอ"]),
+    7: ("เจ็บไหล่", ["ไหล่"]),
+    8: ("ปัญหาข้อเท้า / กระดูกเปราะ", ["ข้อเท้า", "กระดูกเปราะ"]),
+    9: ("เจ็บข้อมือ", ["ข้อมือ"]),
 }
 
-# คำในช่องเงื่อนไขของ Excel ที่ช่วยแยกประเภทข้อความ
-SAFE_WORDS = ["ปลอดภัย", "เหมาะสำหรับ", "แรงกระแทกต่ำ", "ใช้ดัมเบล"]   # ข้อความแนะนำ ไม่ใช่ข้อห้าม
-MODIFY_WORDS = ["ระวัง", "ไม่ควรกลั้นหายใจ", "ให้ลด", "น้อยลง"]        # เล่นได้แต่ต้องปรับ (ลด 1 เซ็ต)
+# ข้อความที่แปลว่า "ท่านี้ปลอดภัย" ไม่ได้ห้ามใคร
+SAFE_WORDS = ["เหมาะ", "ปลอดภัย", "แรงกระแทกต่ำ", "ใช้ดัมเบล"]
+# ข้อความที่แปลว่า "เล่นได้ แต่ให้ลดลง" (ไม่ได้ห้าม)
+SOFT_WORDS = ["ให้ลด", "ให้น้อยลง", "ไม่ควรกลั้นหายใจ"]
 
-# น้ำหนักค่าใช้จ่ายของ A* (ยิ่งมากยิ่ง "เหนื่อย/เสี่ยง")
-STRAIN_KCAL_W = 0.5     # ความเหนื่อยตามปริมาณแคลที่เผาในวันนั้น
-OVERLAP_W = 0.5         # กล้ามเนื้อกลุ่มเดิมซ้ำกับเมื่อวาน (กล้ามเนื้อยังไม่ฟื้น)
-CONSEC_W = 0.2          # ออกกำลังกายติดกันหลายวัน ความล้าสะสม
+DAY_COST = 5  # ค่าความเหนื่อย/ความยุ่งยาก ของการเพิ่มวันออกกำลังกาย 1 วัน
 
 
-# =====================================================================
-#  1) อ่านข้อมูลจาก Excel
-# =====================================================================
-def load_exercises(path=EXCEL_FILE):
-    wb = openpyxl.load_workbook(path, data_only=True)
-    ws = wb[SHEET_NAME]
+# -----------------------------------------------------
+# 1) อ่านข้อมูลท่าออกกำลังกายจากไฟล์ excel
+# -----------------------------------------------------
+def read_exercises(filename):
+    wb = load_workbook(filename)
+    ws = wb["exercises"]
+
     data = []
     for row in ws.iter_rows(min_row=2, values_only=True):
-        if not row[0]:
+        if row[0] is None:
             continue
-        lo, hi = (int(x) for x in str(row[0]).split("-"))
+        age_min, age_max = str(row[0]).split("-")
+        kcal = float(str(row[5]).replace("~", "").replace("kcal", "").strip())
         data.append({
-            "age_lo": lo,
-            "age_hi": hi,
+            "age_min": int(age_min),
+            "age_max": int(age_max),
             "name": row[1],
-            "muscle": set(str(row[2]).split("/")),
-            "muscle_text": row[2],
+            "muscle": row[2],
             "sets": int(row[3]),
             "reps": row[4],
-            "kcal_per_set": float(re.search(r"[\d.]+", str(row[5])).group()),
-            "note": str(row[6] or ""),
+            "kcal_set": kcal,
+            "note": str(row[6]),
         })
     return data
 
 
-# =====================================================================
-#  2) กรองท่าตามอายุ และโรคประจำตัว
-# =====================================================================
-def classify(note, keywords):
-    # คืนค่า "ok" (เล่นได้), "modify" (เล่นได้แต่ลดปริมาณ), "avoid" (ไม่ควรเล่น)
-    if any(w in note for w in SAFE_WORDS):
-        return "ok"
-    if not any(k in note for k in keywords):
-        return "ok"
-    if any(w in note for w in MODIFY_WORDS):
-        return "modify"
-    return "avoid"
+# -----------------------------------------------------
+# 2) คัดท่าที่เหมาะกับอายุและโรคประจำตัว
+# -----------------------------------------------------
+def filter_exercises(all_ex, age, my_diseases):
+    age_used = min(age, 59)  # ไฟล์มีข้อมูลถึง 59 ปี ถ้าอายุมากกว่านี้ใช้ชุดเดียวกับ 40-59
 
+    ok_list = []
+    banned = []
 
-def filter_exercises(exercises, age, diseases):
-    allowed, removed = [], []
-    for ex in exercises:
-        if not (ex["age_lo"] <= age <= ex["age_hi"]):
+    for ex in all_ex:
+        if not (ex["age_min"] <= age_used <= ex["age_max"]):
             continue
-        status, why = "ok", []
-        for d in diseases:
-            s = classify(ex["note"], DISEASE_MENU[d][0])
-            if s == "avoid":
-                status = "avoid"
-                why.append(d)
-            elif s == "modify" and status != "avoid":
-                status = "modify"
-                why.append(d)
-        if status == "avoid":
-            removed.append((ex["name"], why))
+
+        ex = dict(ex)  # copy จะได้ไม่แก้ข้อมูลต้นฉบับ
+        ex["warning"] = ""
+        note = ex["note"]
+
+        is_safe = any(note.startswith(w) for w in SAFE_WORDS)
+        is_soft = any(w in note for w in SOFT_WORDS)
+
+        is_banned = False
+        if not is_safe:
+            for d in my_diseases:
+                disease_name, keywords = DISEASES[d]
+                if any(k in note for k in keywords):
+                    if is_soft:
+                        # เล่นได้ แต่ลดจำนวนเซ็ตลง 1
+                        ex["sets"] = max(1, ex["sets"] - 1)
+                        ex["warning"] = f"มี{disease_name} -> ลดเหลือ {ex['sets']} เซ็ต ({note})"
+                    else:
+                        is_banned = True
+                        banned.append((ex["name"], disease_name))
+                    break
+
+        if is_banned:
             continue
-        sets = ex["sets"] - 1 if status == "modify" else ex["sets"]
-        sets = max(1, sets)
-        allowed.append({**ex, "status": status, "sets": sets,
-                        "kcal": sets * ex["kcal_per_set"]})
-    return allowed, removed
+
+        # เตรียมค่าที่ A* จะใช้
+        k = ex["kcal_set"]
+        ex["cal"] = ex["sets"] * k                    # แคลรวมของท่านี้ (ทุกเซ็ต)
+        ex["effort"] = ex["sets"] * (1 + (k / 5) ** 2)  # ความเหนื่อย (ท่ายิ่งหนัก ยิ่งเหนื่อยเร็วขึ้น)
+        ok_list.append(ex)
+
+    return ok_list, banned
 
 
-# =====================================================================
-#  3) กำหนดขีดจำกัดตามหลัก Heuristic (อายุ + BMI + โรค)
-# =====================================================================
-def build_limits(age, bmi, diseases):
-    rule = next(v for (lo, hi), v in AGE_RULES.items() if lo <= age <= hi)
-    limits = dict(rule)
-    notes = []
-
-    # ลดวัน/ลดแคลตามโรค
-    cut_days, factor = 0, 1.0
-    for d in diseases:
-        _, dd, ff = DISEASE_MENU[d]
-        cut_days += dd
-        factor *= ff
-    if diseases:
-        limits["max_consec"] = min(limits["max_consec"], 2)
-        notes.append("มีโรคประจำตัว: ลดจำนวนวันและแคลต่อวัน ไม่ออกติดกันเกิน 2 วัน")
-    if "โรคหัวใจ" in diseases:
-        limits["max_consec"] = 1
-        notes.append("โรคหัวใจ: ออกกำลังกายวันเว้นวัน")
-
-    # BMI ใช้เกณฑ์ผู้ใหญ่ จึงใช้กับอายุ 20 ปีขึ้นไปเท่านั้น
-    if age >= 20:
-        if bmi >= 30:
-            cut_days += 1
-            factor *= 0.85
-            notes.append("BMI >= 30: ลดภาระต่อข้อต่อ ลด 1 วัน และลดแคลต่อวัน")
-        elif bmi < 18.5:
-            notes.append("BMI < 18.5 (น้ำหนักต่ำกว่าเกณฑ์): ไม่แนะนำให้ลดน้ำหนักเพิ่ม ควรปรึกษาแพทย์")
+# -----------------------------------------------------
+# 3) Heuristic: กำหนดจำนวนวันสูงสุด และจำนวนเซ็ตสูงสุดต่อวัน
+# -----------------------------------------------------
+def find_limit(age, bmi, my_diseases):
+    if age <= 13:
+        max_days, max_sets = 3, 8
+    elif age <= 19:
+        max_days, max_sets = 4, 12
+    elif age <= 39:
+        max_days, max_sets = 5, 16
+    elif age <= 59:
+        max_days, max_sets = 4, 10
     else:
-        notes.append("อายุต่ำกว่า 20 ปี: ไม่ใช้เกณฑ์ BMI ผู้ใหญ่ในการปรับแผน")
+        max_days, max_sets = 3, 8
 
-    # อย่างน้อย 3 วัน/สัปดาห์ เพื่อให้ยังได้ผลและไม่ยืดเวลาเกินไป
-    limits["max_days"] = max(3, limits["max_days"] - cut_days)
-    limits["max_kcal"] = limits["max_kcal"] * max(0.5, factor)
-    return limits, notes
+    for d in my_diseases:
+        if d == 2:              # โรคหัวใจ ลดมากกว่าปกติ
+            max_days -= 2
+        else:
+            max_days -= 1
+    if my_diseases:
+        max_sets = max_sets * 0.8   # มีโรค ลดปริมาณต่อวัน 20%
 
+    if bmi >= 30:               # น้ำหนักเยอะ ข้อต่อรับภาระมาก
+        max_days -= 1
 
-# =====================================================================
-#  4) สร้าง "ชุดออกกำลังกายต่อวัน" (session) จากท่าที่เล่นได้
-# =====================================================================
-def build_sessions(exs, limits):
-    sessions = []
-    n = len(exs)
-    for size in range(min(2, n), min(limits["max_exercises"], n) + 1):
-        for combo in combinations(exs, size):
-            kcal = sum(e["kcal"] for e in combo)
-            if kcal <= limits["max_kcal"]:
-                muscles = set().union(*(e["muscle"] for e in combo))
-                sessions.append({"exs": list(combo), "kcal": kcal, "muscle": muscles})
-    if not sessions:   # ถ้าเกินเพดานทุกชุด ให้ใช้ท่าเดี่ยวที่เบาที่สุด
-        e = min(exs, key=lambda x: x["kcal"])
-        sessions.append({"exs": [e], "kcal": e["kcal"], "muscle": set(e["muscle"])})
-    return sessions
+    max_days = max(max_days, 2)  # อย่างน้อย 2 วัน/สัปดาห์
+    max_sets = max(int(max_sets), 4)
+    return max_days, max_sets
 
 
-# =====================================================================
-#  5) A* Search
-# =====================================================================
-# state n = (day, kcal, consec, week_count, last)
-#   day        = วันที่ผ่านไปแล้ว
-#   kcal       = แคลที่เผาผลาญสะสมแล้ว
-#   consec     = จำนวนวันที่ออกกำลังกายติดกันล่าสุด
-#   week_count = จำนวนวันที่ออกกำลังกายในสัปดาห์ปัจจุบัน
-#   last       = index ของชุดออกกำลังกายเมื่อวาน (-1 = พัก)
-#
-# f(n) = g(n) + h(n)
-# g(n) = ต้นทุนจริงที่ใช้ไปแล้ว (1 ต่อวัน + ความเหนื่อย/ความล้า)
-# h(n) = ค่าประมาณต้นทุนที่เหลือ (จำนวนวันขั้นต่ำ + ความเหนื่อยขั้นต่ำ)
-# f(n) = ต้นทุนรวมที่คาดการณ์
+# -----------------------------------------------------
+# 4) A* Search
+# -----------------------------------------------------
+def a_star(exercises, target, max_days, max_sets):
+    n = len(exercises)
 
-def heuristic(n, target, max_session_kcal, limits):
-    day, kcal, consec, week_count, last = n
-    rem = target - kcal
-    if rem <= 0:
-        return 0.0
+    # ค่า "ความเหนื่อยต่อ 1 แคล" ที่ต่ำที่สุด ใช้ทำ heuristic
+    # (ไม่ว่าเลือกท่าไหน ก็เหนื่อยไม่น้อยกว่านี้ -> h ไม่เกินความจริง)
+    best_ratio = min(ex["effort"] / ex["cal"] for ex in exercises)
 
-    # วันออกกำลังกายขั้นต่ำที่ต้องใช้ ถ้าทุกวันทำได้เต็มที่
-    k = math.ceil(rem / max_session_kcal)
+    def h(cal_now):
+        return max(0.0, target - cal_now) * best_ratio
 
-    # จำกัดโควตาวันออกกำลังกายต่อสัปดาห์ (มองแบบมองโลกในแง่ดีที่สุด จึงไม่เกินจริง)
-    w = limits["max_days"]
-    days_left = 7 - day % 7
-    q = min(w - week_count, days_left)
-    if k <= q:
-        min_days = k
-    else:
-        extra = k - q
-        weeks = math.ceil(extra / w)
-        last_week = extra - w * (weeks - 1)
-        min_days = days_left + 7 * (weeks - 1) + last_week
-
-    # ความเหนื่อยขั้นต่ำ: แคลที่เหลือต้องเผาอย่างน้อย rem
-    min_strain = STRAIN_KCAL_W * rem / limits["max_kcal"]
-    return min_days + min_strain
-
-
-def strain_cost(session, prev_session, consec, limits):
-    cost = STRAIN_KCAL_W * session["kcal"] / limits["max_kcal"]
-    if prev_session is not None:
-        cost += OVERLAP_W * len(session["muscle"] & prev_session["muscle"])
-    cost += CONSEC_W * consec
-    return cost
-
-
-def a_star(target, sessions, limits, consec0=0, last0=-1, horizon=7):
-    # ค้นหาแผน 1 สัปดาห์ (ไม่เกิน horizon วัน) ให้ได้แคลสะสมถึง target
-    # consec0, last0 = สถานะที่ต่อมาจากสัปดาห์ก่อนหน้า
-    max_session_kcal = max(s["kcal"] for s in sessions)
-    start = (0, 0.0, consec0, 0, last0)
-    h0 = heuristic(start, target, max_session_kcal, limits)
-    queue = [(h0, h0, 0.0, start, [])]
-
-    # visited: เก็บ "ชุดที่ดีที่สุด" (kcal, g) ของแต่ละสถานะหลัก (day, consec, week_count, last)
-    # ถ้าสถานะใหม่เผาผลาญได้ไม่มากกว่า และต้นทุนไม่ต่ำกว่า สถานะที่มีอยู่ -> ตัดทิ้ง (dominated)
+    # (f, g, วัน, ท่าที่เล่นวันนี้(bitmask), แคลสะสม, แผน)
+    queue = [(h(0.0), 0.0, 0, 0, 0.0, ((),))]
     visited = {}
 
-    def push(g, n, route):
-        key = (n[0], n[2], n[3], n[4])
-        kcal = n[1]
-        frontier = visited.setdefault(key, [])
-        for k2, g2 in frontier:
-            if k2 >= kcal and g2 <= g:
-                return
-        frontier[:] = [(k2, g2) for k2, g2 in frontier if not (kcal >= k2 and g <= g2)]
-        frontier.append((kcal, g))
-        f = g + heuristic(n, target, max_session_kcal, limits)
-        heapq.heappush(queue, (f, f - g, g, n, route))
-
-    visited[(0, consec0, 0, last0)] = [(0.0, 0.0)]
-
     while queue:
-        f, h, g, n, route = heapq.heappop(queue)
-        day, kcal, consec, week_count, last = n
+        f, g, day, mask, cal, plan = heapq.heappop(queue)
 
-        if kcal >= target:
-            return route, g, kcal
+        if cal >= target:
+            return plan, g, cal
 
-        # ถ้าถูกสถานะอื่นที่ดีกว่าแทนที่ไปแล้ว ให้ข้าม
-        if (kcal, g) not in visited[(day, consec, week_count, last)]:
+        state = (day, mask, round(cal, 1))
+        if state in visited and visited[state] <= g:
             continue
+        visited[state] = g
 
-        if day >= horizon:
-            continue
+        # จำนวนเซ็ตที่เล่นไปแล้วในวันนี้
+        sets_today = 0
+        for i in range(n):
+            if mask & (1 << i):
+                sets_today += exercises[i]["sets"]
 
-        new_day = day + 1
-        can_workout = consec < limits["max_consec"] and week_count < limits["max_days"]
+        # ทางเลือก 1: เพิ่มท่าใหม่ในวันนี้
+        for i in range(n):
+            if mask & (1 << i):
+                continue  # ท่านี้เล่นไปแล้ววันนี้
+            if sets_today + exercises[i]["sets"] > max_sets:
+                continue  # เกินโควต้าต่อวัน (กันออกกำลังกายหนักเกินไป)
 
-        # ทางเลือกที่ 1: วันพัก (บังคับเมื่อออกครบโควตา, เลือกได้เมื่อเพิ่งออกกำลังกายมา)
-        if not can_workout or consec > 0:
-            new_week = 0 if new_day % 7 == 0 else week_count
-            push(g + 1.0, (new_day, kcal, 0, new_week, -1), route + [-1])
+            fatigue = 1 + 0.05 * sets_today  # เล่นมาเยอะแล้ว ท่าต่อไปยิ่งเหนื่อย
+            new_g = g + exercises[i]["effort"] * fatigue
+            new_cal = cal + exercises[i]["cal"]
+            new_plan = plan[:-1] + (plan[-1] + (i,),)
+            new_f = new_g + h(new_cal)
+            heapq.heappush(queue, (new_f, new_g, day, mask | (1 << i), new_cal, new_plan))
 
-        # ทางเลือกที่ 2: ออกกำลังกายด้วยชุดใดชุดหนึ่ง
-        if can_workout:
-            prev = sessions[last] if last >= 0 else None
-            new_week = 0 if new_day % 7 == 0 else week_count + 1
-            for i, sess in enumerate(sessions):
-                nxt = (new_day, round(kcal + sess["kcal"], 1), consec + 1, new_week, i)
-                push(g + 1.0 + strain_cost(sess, prev, consec, limits), nxt, route + [i])
+        # ทางเลือก 2: จบวันนี้ ไปออกกำลังกายวันถัดไป
+        if mask != 0 and day + 1 < max_days:
+            new_g = g + DAY_COST
+            new_plan = plan + ((),)
+            new_f = new_g + h(cal)
+            heapq.heappush(queue, (new_f, new_g, day + 1, 0, cal, new_plan))
 
     return None, 0, 0
 
 
-def plan_weeks(target, sessions, limits):
-    # A* วางแผนทีละสัปดาห์ แล้วต่อกัน
-    # (ถ้าค้นหาทั้งแผนยาวทีเดียว จำนวนสถานะจะเพิ่มแบบทวีคูณและช้ามาก)
-    best = max(s["kcal"] for s in sessions)
-    weekly_cap = limits["max_days"] * best
-    route, total_cost, done = [], 0.0, 0.0
-    consec, last = 0, -1
-
-    for _ in range(MAX_WEEKS):
-        remaining = target - done
-        # สัปดาห์สุดท้าย: ลองให้จบเลยถ้าทำได้ / สัปดาห์ทั่วไป: ตั้งเป้าไม่หนักเต็มเพดาน
-        goals = []
-        if remaining <= weekly_cap:
-            goals.append(remaining)
-        goals += [min(remaining, f * weekly_cap) for f in (WEEK_LOAD, 0.7, 0.5)]
-
-        for goal in goals:
-            week, g, kcal = a_star(goal, sessions, limits, consec, last)
-            if week is not None:
-                break
-        else:
-            return None, 0, 0
-
-        done += kcal
-        total_cost += g
-        finished = done >= target
-        if not finished:
-            week = week + [-1] * (7 - len(week))     # เติมวันพักให้ครบสัปดาห์
-        route += week
-
-        # ส่งต่อสถานะไปสัปดาห์ถัดไป
-        consec = 0
-        for a in reversed(week):
-            if a == -1:
-                break
-            consec += 1
-        last = week[-1]
-
-        if finished:
-            return route, total_cost, done
-    return None, 0, 0
-
-
-# =====================================================================
-#  6) รับข้อมูล + แสดงผล
-# =====================================================================
-def ask_number(text, lo, hi, cast=float):
+# -----------------------------------------------------
+# 5) ฟังก์ชันรับ input
+# -----------------------------------------------------
+def ask_number(text, min_value, max_value):
     while True:
         try:
-            v = cast(input(text))
-            if lo <= v <= hi:
-                return v
+            value = float(input(text))
+            if min_value <= value <= max_value:
+                return value
+            print(f"  กรุณากรอกค่าระหว่าง {min_value} - {max_value}")
         except ValueError:
-            pass
-        print(f"  กรุณากรอกตัวเลขระหว่าง {lo} - {hi}")
+            print("  กรุณากรอกเป็นตัวเลข")
 
 
 def ask_diseases():
-    names = list(DISEASE_MENU.keys())
-    print("\nโรคประจำตัว/อาการ (เลือกได้หลายข้อ คั่นด้วยเครื่องหมายจุลภาค เช่น 1,4):")
-    print("  0. ไม่มี")
-    for i, d in enumerate(names, 1):
-        print(f"  {i}. {d}")
+    print("\nโรคประจำตัว (เลือกได้หลายข้อ พิมพ์เลขคั่นด้วย , เช่น 1,4)")
+    print("  0. ไม่มีโรคประจำตัว")
+    for num, (name, _) in DISEASES.items():
+        print(f"  {num}. {name}")
+
     while True:
-        raw = input("เลือก: ").replace(" ", "")
-        if raw in ("", "0"):
+        text = input("เลือก: ").replace(" ", "")
+        if text == "0":
             return []
         try:
-            idx = {int(x) for x in raw.split(",")}
-            if all(1 <= i <= len(names) for i in idx):
-                return [names[i - 1] for i in sorted(idx)]
+            chosen = [int(x) for x in text.split(",")]
+            if all(c in DISEASES for c in chosen):
+                return sorted(set(chosen))
         except ValueError:
             pass
-        print("  รูปแบบไม่ถูกต้อง")
+        print("  กรุณาพิมพ์เลขตามเมนู")
 
 
-def show_plan(route, total_cost, total_kcal, sessions, target):
-    print("\n" + "=" * 60)
-    print("แผนการออกกำลังกาย")
-    print("=" * 60)
-    done = 0.0
-    for day, a in enumerate(route):
-        if day % 7 == 0:
-            print(f"\n--- สัปดาห์ที่ {day // 7 + 1} ---")
-        if a == -1:
-            print(f"วัน {day + 1:>3}: พัก")
-            continue
-        s = sessions[a]
-        done += s["kcal"]
-        print(f"วัน {day + 1:>3}: ออกกำลังกาย (~{s['kcal']:.1f} kcal | สะสม {done:.1f})")
-        for e in s["exs"]:
-            adj = "  [ลดเหลือ %d เซ็ต]" % e["sets"] if e["status"] == "modify" else ""
-            print(f"          - {e['name']} ({e['muscle_text']}) "
-                  f"{e['sets']} เซ็ต x {e['reps']}{adj}")
-            print(f"            หมายเหตุจาก Excel: {e['note']}")
+# -----------------------------------------------------
+# 6) main
+# -----------------------------------------------------
+print("===== ระบบแนะนำการออกกำลังกาย =====")
+age = int(ask_number("อายุ (ปี): ", 7, 100))
+weight = ask_number("น้ำหนัก (กก.): ", 10, 300)
+height = ask_number("ส่วนสูง (ซม.): ", 80, 250)
+my_diseases = ask_diseases()
+target_cal = ask_number("\nปริมาณแคลที่อยากลด (kcal): ", 1, 100000)
 
-    workout_days = sum(1 for a in route if a != -1)
-    print("\n" + "-" * 60)
-    print(f"แคลที่ต้องการลด : {target:.0f} kcal")
-    print(f"แคลที่ได้ตามแผน  : {total_kcal:.1f} kcal")
-    print(f"ระยะเวลารวม      : {len(route)} วัน (ออกกำลังกาย {workout_days} วัน, พัก {len(route) - workout_days} วัน)")
-    print(f"ต้นทุนรวม A* (g) : {total_cost:.2f}")
+# คำนวณ BMI
+bmi = weight / ((height / 100) ** 2)
+print(f"\nBMI = {bmi:.1f}", end=" ")
+if bmi < 18.5:
+    print("(น้ำหนักต่ำกว่าเกณฑ์ ไม่แนะนำให้ลดน้ำหนักเพิ่ม ควรปรึกษาแพทย์)")
+elif bmi < 23:
+    print("(สมส่วน)")
+elif bmi < 25:
+    print("(น้ำหนักเกินเล็กน้อย)")
+elif bmi < 30:
+    print("(อ้วนระดับ 1)")
+else:
+    print("(อ้วนระดับ 2 ระวังเรื่องข้อเข่า/ข้อเท้า)")
 
+if age > 59:
+    print("หมายเหตุ: ไฟล์มีข้อมูลถึงอายุ 59 ปี จึงใช้ท่าของกลุ่ม 40-59 และลดจำนวนวันลง")
 
-def main():
-    print("=== ระบบแนะนำการออกกำลังกาย (A* Search) ===")
-    age = ask_number("อายุ (ปี): ", 1, 120, int)
-    weight = ask_number("น้ำหนัก (กก.): ", 10, 300)
-    height = ask_number("ส่วนสูง (ซม.): ", 50, 250)
-    diseases = ask_diseases()
-    target = ask_number("แคลอรีที่ต้องการลด (kcal): ", 1, 100000)
+# อ่าน excel + คัดท่า
+all_ex = read_exercises(FILE_NAME)
+exercises, banned = filter_exercises(all_ex, age, my_diseases)
 
-    exercises = load_exercises()
-    ages = [(e["age_lo"], e["age_hi"]) for e in exercises]
-    if not any(lo <= age <= hi for lo, hi in ages):
-        print(f"\nข้อมูลใน Excel รองรับอายุ {min(a[0] for a in ages)}-{max(a[1] for a in ages)} ปีเท่านั้น")
-        return
+if banned:
+    print("\nท่าที่ไม่แนะนำสำหรับคุณ:")
+    for name, why in banned:
+        print(f"  - {name} (เพราะ {why})")
 
-    bmi = weight / (height / 100) ** 2
-    print(f"\nอายุ {age} ปี | BMI = {bmi:.1f} | โรค: {', '.join(diseases) if diseases else 'ไม่มี'}")
+if len(exercises) == 0:
+    print("\nไม่มีท่าที่เหมาะสม กรุณาปรึกษาแพทย์ก่อนออกกำลังกาย")
+    raise SystemExit
 
-    limits, notes = build_limits(age, bmi, diseases)
-    for t in notes:
-        print(" *", t)
-    print(f" * ขีดจำกัด: ออกได้ไม่เกิน {limits['max_days']} วัน/สัปดาห์, "
-          f"ติดกันไม่เกิน {limits['max_consec']} วัน, "
-          f"ไม่เกิน {limits['max_kcal']:.0f} kcal/วัน")
+# หาจำนวนวัน/โควต้าต่อวัน
+max_days, max_sets = find_limit(age, bmi, my_diseases)
 
-    allowed, removed = filter_exercises(exercises, age, diseases)
-    for name, why in removed:
-        print(f" x ตัดท่า {name} ออก (ไม่เหมาะกับ: {', '.join(why)})")
-    if not allowed:
-        print("\nไม่พบท่าที่เหมาะสม กรุณาปรึกษาแพทย์หรือผู้เชี่ยวชาญก่อนออกกำลังกาย")
-        return
+# หาว่า 1 วัน เผาผลาญได้มากสุดเท่าไหร่ (ภายใต้โควต้าเซ็ต) -> ดูว่า 1 สัปดาห์ทำได้กี่แคล
+best_day_cal = 0
+for mask in range(1 << len(exercises)):
+    s = 0
+    c = 0
+    for i in range(len(exercises)):
+        if mask & (1 << i):
+            s += exercises[i]["sets"]
+            c += exercises[i]["cal"]
+    if s <= max_sets and c > best_day_cal:
+        best_day_cal = c
 
-    sessions = build_sessions(allowed, limits)
+week_capacity = best_day_cal * max_days
 
-    # เช็กก่อนว่าเป้าหมายทำได้จริงภายใน MAX_WEEKS สัปดาห์หรือไม่
-    best = max(x["kcal"] for x in sessions)
-    weekly_cap = limits["max_days"] * best
-    max_possible = (MAX_WEEKS - 1) * WEEK_LOAD * weekly_cap + weekly_cap   # สอดคล้องกับ plan_weeks
-    if target > max_possible:
-        print(f"\nเป้าหมายสูงเกินไปสำหรับการลดอย่างปลอดภัยภายใน {MAX_WEEKS} สัปดาห์ "
-              f"(ทำได้สูงสุดประมาณ {max_possible:.0f} kcal) ลองลดเป้าหมายลง")
-        return
+# ถ้าเป้าหมายมากกว่าที่ปลอดภัยต่อสัปดาห์ ให้แบ่งเป็นหลายสัปดาห์
+weeks = math.ceil(target_cal / week_capacity)
+week_target = target_cal / weeks
 
-    route, total_cost, total_kcal = plan_weeks(target, sessions, limits)
+route, total_effort, total_cal = a_star(exercises, week_target, max_days, max_sets)
 
-    if route:
-        show_plan(route, total_cost, total_kcal, sessions, target)
-        print("\nหมายเหตุ: เป็นคำแนะนำเบื้องต้น หากมีโรคประจำตัวควรปรึกษาแพทย์ก่อนเริ่มออกกำลังกาย")
+if route is None:
+    print("ไม่พบแผนที่เหมาะสม")
+    raise SystemExit
+
+# จัดลงตารางสัปดาห์ (เอาวันที่ว่างเปล่าออก)
+route = [d for d in route if len(d) > 0]
+n_days = len(route)
+positions = WEEK_PATTERN[n_days]
+
+print("\n===== แผนออกกำลังกาย 1 สัปดาห์ =====")
+print(f"ออกกำลังกาย {n_days} วัน / พัก {7 - n_days} วัน")
+
+for day_index in range(7):
+    if day_index in positions:
+        todo = route[positions.index(day_index)]
+        day_cal = sum(exercises[i]["cal"] for i in todo)
+        print(f"\nวัน{DAY_NAMES[day_index]}  (เผาผลาญประมาณ {day_cal:.1f} kcal)")
+        for i in todo:
+            ex = exercises[i]
+            print(f"  - {ex['name']} ({ex['muscle']}): {ex['sets']} เซ็ต x {ex['reps']}"
+                  f"  ~{ex['cal']:.1f} kcal")
+            if ex["warning"]:
+                print(f"      ** {ex['warning']}")
     else:
-        print(f"\nไม่พบแผนที่ปลอดภัยภายใน {MAX_WEEKS} สัปดาห์ ลองลดเป้าหมายแคลลง")
+        print(f"\nวัน{DAY_NAMES[day_index]}  พักผ่อน")
 
-
-if __name__ == "__main__":
-    main()
+print("\n===== สรุป =====")
+print(f"เผาผลาญได้สัปดาห์ละ ~{total_cal:.1f} kcal")
+if weeks > 1:
+    print(f"เป้าหมาย {target_cal:.0f} kcal มากเกินกว่าจะทำในสัปดาห์เดียวอย่างปลอดภัย")
+    print(f"แนะนำให้ทำตามแผนนี้ซ้ำ {weeks} สัปดาห์")
+else:
+    print(f"ครบเป้าหมาย {target_cal:.0f} kcal ภายใน 1 สัปดาห์")
+print("(ค่าความเหนื่อยรวมของแผนตาม A* = {:.2f})".format(total_effort))
+print("\n*** ข้อมูลนี้เป็นเพียงคำแนะนำเบื้องต้น หากมีโรคประจำตัวควรปรึกษาแพทย์ ***")
