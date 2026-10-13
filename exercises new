@@ -1,0 +1,276 @@
+import heapq
+import pandas as pd
+
+# ---------------------------------------------------------
+# ระบบแนะนำการออกกำลังกาย (ใช้ A* Search หาจำนวนสัปดาห์ที่น้อยที่สุด)
+# f(n) = g(n) + h(n)
+#   g(n) = จำนวนสัปดาห์ที่ใช้ไปแล้ว (เริ่มที่ 0)
+#   h(n) = แคลอรี่ที่ยังขาดอยู่จนถึงเป้าหมาย
+# ---------------------------------------------------------
+
+FILE_NAME = "exercises.xlsx"
+
+DAY_NAMES = ["จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์", "อาทิตย์"]
+
+DISEASES = {
+    1: "ความดันโลหิตสูง",
+    2: "โรคหัวใจ",
+    3: "เบาหวาน",
+    4: "ปวดเข่า / ข้อเข่าเสื่อม",
+    5: "ปวดหลัง / หมอนรองกระดูกทับเส้น",
+    6: "ปวดคอ",
+    7: "เจ็บไหล่",
+    8: "ปัญหาข้อเท้า / กระดูกเปราะ",
+    9: "เจ็บข้อมือ",
+}
+
+# ท่าที่ "ไม่ควรเล่น" ของแต่ละโรค (อ้างจากคอลัมน์เงื่อนไขใน excel)
+# (ชีต disease ใน excel ยังว่างอยู่ เลยเขียนไว้ในโค้ดก่อน)
+BAD_EXERCISES = {
+    1: ["Standard Push-up", "Elbow Plank", "Burpee"],
+    2: ["Burpee"],
+    3: [],
+    4: ["Walking Lunge", "Barbell / Dumbbell Squat", "Burpee", "Chair Squat"],
+    5: ["Elbow Plank", "Barbell / Dumbbell Squat", "Bent-Over Dumbbell Row", "Bicycle Crunch"],
+    6: ["Bicycle Crunch"],
+    7: ["Dumbbell Bench Press", "Pull-up / Inverted Row"],
+    8: ["Jumping Jacks"],
+    9: ["Bear Crawl"],
+}
+
+# จำนวนวันออกกำลังกายสูงสุดต่อสัปดาห์ ตามช่วงอายุ
+MAX_DAYS_BY_AGE = {"7-13": 3, "14-19": 4, "20-39": 4, "40-59": 3}
+
+# โรคที่ทำให้ต้องลดจำนวนวันลง (วัน)
+DAYS_PENALTY = {1: 1, 2: 2, 3: 1}
+
+# วันที่ใช้ออกกำลังกายในสัปดาห์ (0 = จันทร์) เลือกให้มีวันพักคั่น
+DAY_PATTERN = {
+    1: [0],
+    2: [0, 3],
+    3: [0, 2, 4],
+    4: [0, 1, 3, 5],
+}
+
+EX_PER_DAY = 3  # ท่าต่อวัน ไม่ให้เยอะเกินไป
+
+
+# ---------------------------------------------------------
+# 1. อ่านข้อมูลจาก excel
+# ---------------------------------------------------------
+def load_exercises():
+    df = pd.read_excel(FILE_NAME, sheet_name="exercises")
+    data = []
+    for _, row in df.iterrows():
+        kcal = float(str(row["แคลอรีที่ลดต่อ 1 เซ็ต"]).replace("~", "").replace("kcal", "").strip())
+        data.append({
+            "age_range": str(row["ช่วงอายุ"]).strip(),
+            "name": str(row["ชื่อท่า"]).strip(),
+            "muscle": str(row["ส่วนกล้ามเนื้อ"]).strip(),
+            "sets": int(row["จำนวนเซ็ต"]),
+            "reps": str(row["ครั้ง/เวลาต่อเซ็ต"]).strip(),
+            "kcal_per_set": kcal,
+        })
+    return data
+
+
+# ---------------------------------------------------------
+# 2. รับข้อมูลจากผู้ใช้
+# ---------------------------------------------------------
+def read_number(text, is_int=False):
+    while True:
+        try:
+            value = float(input(text))
+            if value <= 0:
+                print("  กรุณากรอกตัวเลขที่มากกว่า 0")
+                continue
+            return int(value) if is_int else value
+        except ValueError:
+            print("  กรุณากรอกเป็นตัวเลข")
+
+
+def read_diseases():
+    print("โรคประจำตัว (เลือกได้หลายข้อ พิมพ์เลขคั่นด้วย , เช่น 1,4)")
+    print("0. ไม่มีโรคประจำตัว\n")
+    for num, name in DISEASES.items():
+        print(f"{num}. {name}")
+
+    while True:
+        text = input("เลือก: ").replace(" ", "")
+        try:
+            nums = [int(x) for x in text.split(",") if x != ""]
+        except ValueError:
+            print("  กรุณาพิมพ์เป็นตัวเลข")
+            continue
+        if len(nums) == 0 or any(n < 0 or n > 9 for n in nums):
+            print("  กรุณาเลือกเลข 0-9")
+            continue
+        return sorted(set(n for n in nums if n != 0))
+
+
+# ---------------------------------------------------------
+# 3. เงื่อนไข: เลือกช่วงอายุ / กรองท่า / หาจำนวนวันสูงสุด
+# ---------------------------------------------------------
+def get_age_group(age):
+    if age < 7:
+        return None
+    if age <= 13:
+        return "7-13"
+    if age <= 19:
+        return "14-19"
+    if age <= 39:
+        return "20-39"
+    return "40-59"  # อายุ 60 ขึ้นไปใช้กลุ่มเบาสุดไปก่อน
+
+
+def filter_exercises(data, age_group, diseases):
+    banned = []
+    for d in diseases:
+        banned += BAD_EXERCISES[d]
+    result = []
+    for ex in data:
+        if ex["age_range"] == age_group and ex["name"] not in banned:
+            result.append(ex)
+    return result
+
+
+def get_max_days(age, age_group, diseases):
+    days = MAX_DAYS_BY_AGE[age_group]
+    if age >= 60:
+        days = 2  # ผู้สูงอายุออกน้อยลง
+    for d in diseases:
+        days -= DAYS_PENALTY.get(d, 0)
+    return max(days, 1)
+
+
+# ---------------------------------------------------------
+# 4. จัดท่าลงแต่ละวัน
+# ---------------------------------------------------------
+def make_days(exercises):
+    # หมุนท่าไปเรื่อยๆ ให้แต่ละวันได้ท่าไม่เหมือนกัน
+    n = len(exercises)
+    per_day = min(EX_PER_DAY, n)
+    days = []
+    for j in range(max(DAY_PATTERN)):
+        day = []
+        for k in range(per_day):
+            day.append(exercises[(j * per_day + k) % n])
+        days.append(day)
+    return days
+
+
+def day_kcal(day):
+    total = 0
+    for ex in day:
+        total += ex["sets"] * ex["kcal_per_set"]
+    return total
+
+
+# ---------------------------------------------------------
+# 5. A* Search
+#    state = (สัปดาห์ที่ผ่านไป, แคลที่เผาผลาญสะสม)
+#    action = เลือกว่าสัปดาห์ถัดไปออกกี่วัน (1..max_days)
+# ---------------------------------------------------------
+def a_star(goal, kcal_by_days, max_days):
+    start_g = 0
+    start_burned = 0.0
+    start_h = goal - start_burned
+    start_f = start_g + start_h
+
+    # (f, วันออกกำลังกายรวม, g, แคลสะสม, เส้นทาง)
+    # วันรวมใส่ไว้เป็น tie-break ถ้า f เท่ากันเลือกแผนที่ออกน้อยวันกว่า
+    open_list = [(start_f, 0, start_g, start_burned, [])]
+    visited = set()
+
+    while open_list:
+        f, total_days, g, burned, path = heapq.heappop(open_list)
+
+        # Goal state: เผาผลาญครบตามเป้า (h = 0)
+        if burned >= goal:
+            return path
+
+        key = (g, round(burned, 2))
+        if key in visited:
+            continue
+        visited.add(key)
+
+        # ขยาย node: ลองออกกำลังกาย 1..max_days วันในสัปดาห์ถัดไป
+        for d in range(1, max_days + 1):
+            new_g = g + 1
+            new_burned = burned + kcal_by_days[d]
+            new_h = max(goal - new_burned, 0)
+            new_f = new_g + new_h
+            heapq.heappush(open_list, (new_f, total_days + d, new_g, new_burned, path + [d]))
+
+    return []
+
+
+# ---------------------------------------------------------
+# 6. แสดงผล
+# ---------------------------------------------------------
+def show_plan(days, days_in_week):
+    schedule = DAY_PATTERN[days_in_week]
+    rest_days = 7 - days_in_week
+    print("\n===== แผนออกกำลังกาย 1 สัปดาห์ =====")
+    print(f"ออกกำลังกาย {days_in_week} วัน / พัก {rest_days} วัน\n")
+
+    workout_no = 0
+    for i in range(7):
+        if i in schedule:
+            day = days[workout_no]
+            workout_no += 1
+            print(f"วัน{DAY_NAMES[i]} (เผาผลาญประมาณ {day_kcal(day):.1f} kcal)\n")
+            for ex in day:
+                kcal = ex["sets"] * ex["kcal_per_set"]
+                print(f"* {ex['name']} ({ex['muscle']}): {ex['sets']} เซ็ต x {ex['reps']} ~{kcal:.1f} kcal")
+            print()
+        else:
+            print(f"วัน{DAY_NAMES[i]} พักผ่อน")
+
+
+def main():
+    print("===== ระบบแนะนำการออกกำลังกาย =====")
+    age = read_number("อายุ (ปี): ", True)
+    weight = read_number("น้ำหนัก (กก.): ")
+    height = read_number("ส่วนสูง (ซม.): ")
+    diseases = read_diseases()
+    goal = read_number("\nปริมาณแคลที่อยากลด (kcal): ")
+
+    age_group = get_age_group(age)
+    if age_group is None:
+        print("ระบบนี้รองรับอายุตั้งแต่ 7 ปีขึ้นไป")
+        return
+
+    data = load_exercises()
+    exercises = filter_exercises(data, age_group, diseases)
+    if len(exercises) == 0:
+        print("ไม่มีท่าที่เหมาะสมกับโรคประจำตัวของคุณ ควรปรึกษาแพทย์")
+        return
+
+    max_days = get_max_days(age, age_group, diseases)
+    days = make_days(exercises)
+
+    # แคลที่เผาผลาญได้ต่อสัปดาห์ ถ้าออก d วัน (d = 1..max_days)
+    kcal_by_days = {}
+    for d in range(1, max_days + 1):
+        kcal_by_days[d] = sum(day_kcal(days[j]) for j in range(d))
+
+    path = a_star(goal, kcal_by_days, max_days)  # เช่น [4, 4, 2] = 3 สัปดาห์
+
+    show_plan(days, path[0])
+
+    total_weeks = len(path)
+    print("\n===== สรุป =====")
+    print(f"เผาผลาญได้สัปดาห์ละ ~{kcal_by_days[path[0]]:.1f} kcal")
+    print(f"ใช้เวลาทั้งหมด {total_weeks} สัปดาห์")
+    if total_weeks > 1:
+        print("รายละเอียดแต่ละสัปดาห์:")
+        for i, d in enumerate(path):
+            print(f"  สัปดาห์ที่ {i + 1}: ออกกำลังกาย {d} วัน ({kcal_by_days[d]:.1f} kcal)")
+
+
+main()
+
+
+if __name__ == "__main__":
+    main()
